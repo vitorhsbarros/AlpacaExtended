@@ -25,6 +25,7 @@ display code, so these files are for `v1.0.0`.
 | `core/interface/ndlrPanel/` | The panel: clock, chords, Pad, Drone, motifs, editors, Chord Sequencer |
 | `core/libs/NewDisplay/ndlrPanelControl.*` | Draws the panel, its sub screens and the editors |
 | `core/source/NdlrRecorder.*` | The REC button: records the stereo mix to `/Recordings` |
+| `core/source/NdlrCapture.*` | Capture: writes the parts into the pattern, with the Chord FX for chords |
 | `core/source/mtSequencer.*`, `mtMidi.*` | The Tracker clock for the panel, and notes to the four synths |
 | `core/synth/Synth.*` | Voice sharing between the four synths |
 | `core/interface/samplePlayback/`, `core/libs/Audio/play_memory*` | Loop setting for sample playback |
@@ -45,11 +46,54 @@ display code, so these files are for `v1.0.0`.
 - Quantised launches (next beat or next bar), the Tracker's clock or its own, accent patterns, and
   tap tempo on the panel's SHIFT.
 
+## Menu mode: MIDI out and capture
+
+Press MENU to enter Menu mode. The dials then do this:
+
+| Dial | Label | Turn | Press |
+| --- | --- | --- | --- |
+| 1-4 | PAD OUT, DRN OUT, M1 OUT, M2 OUT | The part's own synth (Synth 1-4) or MIDI channel 1-16 | - |
+| 5 | CAPTURE | Parts to capture: all, one, both motifs, or Pad + Drone | Arm or stop the capture |
+| 6 | CAP TRK | The first track written (default 9) | Arm or stop |
+| 7 | PAD TRKS | Tracks for the Pad, 1-8 (default 2) | Arm or stop |
+| 8 | STRM/LEN | STRUM: keep a strummed Pad's timing, or ignore the strum. LENGTH: keep the pattern's length, or fit it to the parts' cycle | Switch between STRUM and LENGTH |
+
+- **MIDI out.** A part set to a MIDI channel goes out through the Tracker's MIDI out, so set
+  Config > MIDI > Notes out to USB, Jack or both. The Tracker's middle C setting applies. A part on
+  MIDI does not use or limit the internal synth's voices. Changing a part's output ends its notes
+  first.
+- **Capture.** Press dial 5-8 to arm it. It writes one pattern's length of steps, and the step can
+  be undone.
+  - With the Tracker stopped, or the panel on its own clock: it starts on the panel's next bar
+    with a captured part playing. The parts carry on afterwards.
+  - With the Tracker playing the pattern and the panel on CLK:Trk: it starts when the pattern
+    starts again with a captured part playing, and then stops the captured parts so the pattern
+    plays them.
+- **Cycle length.** LENGTH shows how many steps the captured parts take to repeat: whole bars, each
+  motif until its rhythm and pattern line up again (a Random variation counts its rhythm only),
+  the Drone's repeats, and an armed Chord Sequencer's whole song. "Keep 32 (of 96)" means the
+  pattern is 32 steps and a full cycle is 96. With "Fit" the capture sets the pattern to the
+  cycle first, up to 128 steps. The cycle follows the chord too: an Auto pattern length is twice
+  the chord's notes, so a 7th chord makes a longer cycle than a triad.
+- Tracks are given out in order from CAP TRK: the Pad gets PAD TRKS tracks, the Drone two, each
+  motif one. The tracks are cleared first. Each note uses the part's instrument: its synth, or the
+  MIDI instrument of its channel.
+- A chord that is one of the Tracker's Chord FX shapes (root position, up to four notes within
+  fourteen semitones) goes on one track as its lowest note with the Chord FX. Other voicings are
+  split: track by track, the lowest note left with the biggest shape built on it. Notes that do not
+  fit on the part's tracks are left out, and the toast says how many.
+- A strum kept goes one note per Pad track with micromove. A strum ignored is written as one chord.
+- Notes between steps are written with micromove (twelve NDLR pulses to a step). A note-off goes
+  on the step the note ends in, at least one step after it starts.
+- Capture stops early if playback stops or restarts, or the Tracker moves to another pattern.
+
 ## Limits
 
 - User patterns, rhythms and sequences are kept in RAM and are lost at power-off.
 - The Tonic modes, the Mod Matrix, LFO and Settings menus, and the MIDI Controller and Perlin editors
-  are not in this build.
+  are not in this build. Menu mode holds the MIDI out and capture settings instead.
+- The MIDI out and capture settings are kept until power-off.
+- Capture writes one pattern, the one playing, up to 128 steps.
 
 ## For anyone changing the panel
 
@@ -57,6 +101,9 @@ display code, so these files are for `v1.0.0`.
   about 6300 at most. Text is the expensive part: one command per glyph.
 - While the Motif sub screen or an editor is showing, the panel redraws on every motif step to move
   the playhead. `kShowPlayhead` near the top of `fNdlrPanel.cpp` turns that off.
+
+- `tests/ndlrCapture/run.sh` tests the capture writer on a computer, with stubs for the Tracker:
+  `TRACKER_CE=/path/to/tracker-ce firmware/source/tests/ndlrCapture/run.sh`.
 
 ## Licence
 

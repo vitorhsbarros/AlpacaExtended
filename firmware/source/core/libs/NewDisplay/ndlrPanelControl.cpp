@@ -60,8 +60,8 @@ static const char* const kEncLabel[8][5] = {
     { "TEMPO", "KEY", "MODE", "QNT", "CLOCK" }, { "POS", "P-LEN", "" }, { "VAR", "PATT", "" },
     { "DIV", "R-LEN", "GATE" },  { "ACCNT", "RHY", "OFFS" },
 };
-static const char* const kEncMenuName[8] = { "MOD 1&2", "MOD 3&4", "MOD 5&6", "MOD 7&8",
-                                             "LFO CFG", "SET 1",   "SET 2",   "SET 3" };
+static const char* const kEncMenuName[8] = { "PAD OUT", "DRN OUT", "M1 OUT", "M2 OUT",
+                                             "CAPTURE", "CAP TRK", "PAD TRKS", "STRM/LEN" };
 static const char* const kEncEditorName[8] = { "CHORD SEQ", "",       "",       "MIDI CTL",
                                                "PATT ED",   "RHY ED", "PERLIN", "" };
 
