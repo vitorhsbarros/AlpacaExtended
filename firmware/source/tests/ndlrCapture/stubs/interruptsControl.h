@@ -1,0 +1,3 @@
+#pragma once
+#define DISABLE_AUDIO_INTERRUPTS()
+#define ENABLE_AUDIO_INTERRUPTS()

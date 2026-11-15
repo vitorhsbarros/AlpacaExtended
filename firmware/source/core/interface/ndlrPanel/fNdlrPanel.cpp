@@ -5,9 +5,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
+
 #include "core/interfaceMenuPopup.h"
 #include "core/songTimer.h"
 
+#include "NdlrCapture.h"
 #include "NdlrRecorder.h"
 #include "Platform.h"
 #include "fileManager.h"
@@ -64,6 +67,24 @@ static constexpr const char* kQuantiseShort[] = { "Q:Off", "Q:Beat", "Q:Bar" };
 static constexpr const char* kClockNames[] = { "Tracker", "Internal" };
 static constexpr const char* kClockShort[] = { "CLK:Trk", "CLK:Int" };
 static constexpr uint8_t kAllParts = 0x0f;
+
+// Each part plays on its own synth (0) or on an external MIDI channel (1-16), through the
+// Tracker's MIDI out (Config > MIDI > Notes out picks USB, the jack, or both).
+static constexpr uint8_t kMidiChannels = 16;
+
+// Capture writes the parts into the current pattern for one pass of it. Each part gets its own
+// run of tracks from CAP TRK on: the Pad as many as PAD TRKS, the Drone two, each motif one.
+static constexpr const char* kCaptureNames[] = { "All parts", "Pad", "Drone", "Motif 1", "Motif 2", "Motifs", "Pad + Drone" };
+static constexpr uint8_t kCaptureParts[] = { 0x0f, 0x01, 0x02, 0x04, 0x08, 0x0c, 0x03 };
+static constexpr uint8_t kDroneTracks = 2;
+static constexpr uint8_t kMaxPadTracks = 8;
+static constexpr uint8_t kPulsesPerStep = kPulsesPerBeat / 4;
+enum enCaptureState : uint8_t
+{
+    capOff,
+    capArmed,   // waits for the pattern to start again with a captured part playing
+    capRunning, // writing until the end of the pattern
+};
 
 // Redraw the Motif sub screen and the editors on every motif step so they show the note being
 // played. Set this to false if note timing becomes uneven while those screens are open.
@@ -186,6 +207,7 @@ struct MotifPlayback
     uint32_t patternStep;
     uint8_t rhythmStep;
     int16_t note;
+    uint8_t velocity;
     bool started;
     int8_t pos;  // pattern note last played, for the sub screen
     int8_t beat; // rhythm beat last reached, for the sub screen
@@ -389,7 +411,17 @@ struct strState
     int8_t seqPlayStep;
     int8_t seqPlaySlot;
 
-
+    uint8_t partOut[4];   // 0 plays the part's synth, 1-16 a MIDI channel
+    uint8_t capParts;     // index into kCaptureParts
+    uint8_t capTrack;     // first track, 0-15
+    uint8_t padTracks;    // tracks for the Pad, 1-8
+    bool strumKeep;       // a strummed Pad keeps its timing, one note per track
+    uint8_t capState;
+    uint8_t capPattern;   // the pattern being written
+    uint32_t capStart;    // the pulse of the pattern's first step
+    uint32_t capLength;   // the pattern's length in pulses
+    uint32_t capLastPos;  // where in the pattern the previous frame was, to see it wrap
+    uint32_t trackerPos;  // the Tracker's position in pulses from its first step, with s.pulse
 };
 
 static strState s;
@@ -416,15 +448,52 @@ static void toast(const char* msg, bool recordingMessage = false)
 //==============================================================================================
 // Sound
 //==============================================================================================
+static bool external(int part)
+{
+    return s.partOut[part] != 0;
+}
+
+// `channel` is the part's synth, 1-4. A part sent out plays on its MIDI channel instead.
 static void synthNote(bool on, int note, uint8_t velocity, uint8_t channel)
 {
     if (note < 0 || note > 127)
     {
         return;
     }
+    const int part = channel - 1;
     DISABLE_AUDIO_INTERRUPTS();
-    sendNdlrSynthNote(on, static_cast<uint8_t>(note), velocity, channel);
+    if (external(part))
+    {
+        if (on)
+            sendMidiNoteOn(static_cast<uint8_t>(note), velocity, s.partOut[part], false);
+        else
+            sendMidiNoteOff(static_cast<uint8_t>(note), 0, s.partOut[part], false);
+    }
+    else
+        sendNdlrSynthNote(on, static_cast<uint8_t>(note), velocity, channel);
     ENABLE_AUDIO_INTERRUPTS();
+}
+
+// Voices are only limited on the internal synths.
+static int partVoices(int part)
+{
+    return external(part) ? kMaxPadNotes : s.voices[part];
+}
+
+static void wantVoices(int part, int wanted)
+{
+    P->reserveVoices(part, external(part) ? 0 : wanted);
+}
+
+// Capture: the pulse from the pattern's first step, and whether the part is being written.
+static bool capturing(int part)
+{
+    return s.capState == capRunning && (kCaptureParts[s.capParts] >> part & 1);
+}
+
+static int32_t capturePulse(uint32_t pulse)
+{
+    return static_cast<int32_t>(pulse - s.capStart);
 }
 
 static uint8_t resolvedType()
@@ -499,6 +568,7 @@ static void advanceClock(uint32_t now)
             s.barPulse = (s.barPulse + pulses) % kPulsesPerBar;
         }
         s.trackerPulse = tracker.pulse;
+        s.trackerPos = tracker.startStep * kPulsesPerStep + tracker.pulse;
         return;
     }
     if (s.trackerClock)
@@ -525,17 +595,21 @@ static int inMidiRange(int note)
     return note;
 }
 
-static void releasePad()
+static void releasePad(uint32_t pulse = s.pulse)
 {
     for (int i = 0; i < s.padPlayed; i++)
         synthNote(false, s.padNotes[i], 0, kChPad);
+    if (s.padPlayed && capturing(0))
+        ndlrCapture::release(0, capturePulse(pulse));
     s.padCount = s.padPlayed = 0;
 }
 
-static void releaseDrone()
+static void releaseDrone(uint32_t pulse = s.pulse)
 {
     for (int i = 0; i < s.droneCount; i++)
         synthNote(false, s.droneNotes[i], 0, kChDrone);
+    if (s.droneCount && capturing(1))
+        ndlrCapture::release(1, capturePulse(pulse));
     s.droneCount = 0;
 }
 
@@ -543,8 +617,18 @@ static void releaseMotif(int index)
 {
     auto& voice = s.motifPlayback[index];
     if (voice.note >= 0)
+    {
         synthNote(false, voice.note, 0, kChMotif1 + index);
+        // The frame can come after the gate ended; the note ended at the gate.
+        if (capturing(index + 2))
+            ndlrCapture::release(index + 2, capturePulse(due(s.pulse, voice.noteEnd) ? voice.noteEnd : s.pulse));
+    }
     voice.note = -1;
+}
+
+static bool strumOnTracks()
+{
+    return s.padStrum != 0 && s.strumKeep;
 }
 
 static void allNotesOff()
@@ -560,6 +644,8 @@ static void playPadNotes()
     while (s.padPlayed < s.padCount && due(s.pulse, s.padNext))
     {
         synthNote(true, s.padNotes[s.padPlayed], kVelPad, kChPad);
+        if (capturing(0) && strumOnTracks())
+            ndlrCapture::note(0, s.padPlayed, capturePulse(s.padNext), s.padNotes[s.padPlayed], kVelPad);
         ++s.padPlayed;
         const bool together = (s.padStrum == 4 || s.padStrum == 6) && s.padPlayed < 3;
         if (!together)
@@ -624,14 +710,16 @@ static int padVoicing(int16_t* notes, int voices)
 
 static void voicePad(uint32_t pulse = s.pulse)
 {
-    releasePad();
+    releasePad(pulse);
     if (!s.partOn[0])
         return;
 
     const int wanted = s.padRange ? s.padRange : kShape[resolvedType()].n;
-    P->reserveVoices(0, wanted);
-    s.padCount = static_cast<uint8_t>(padVoicing(s.padNotes, s.voices[0]));
+    wantVoices(0, wanted);
+    s.padCount = static_cast<uint8_t>(padVoicing(s.padNotes, partVoices(0)));
     s.padNext = pulse;
+    if (capturing(0) && !strumOnTracks())
+        ndlrCapture::chord(0, capturePulse(pulse), s.padNotes, s.padCount, kVelPad);
     playPadNotes();
 }
 
@@ -650,17 +738,27 @@ static int droneVoicing(int16_t* notes, int voices)
     return count;
 }
 
-static void voiceDrone()
+static void voiceDrone(uint32_t pulse = s.pulse)
 {
-    releaseDrone();
+    releaseDrone(pulse);
     if (!s.partOn[1])
         return;
 
     const int desired = s.droneNotesMode == 0 ? 1 : s.droneNotesMode == 3 ? 3 : 2;
-    P->reserveVoices(1, desired);
-    s.droneCount = static_cast<uint8_t>(droneVoicing(s.droneNotes, s.voices[1]));
+    wantVoices(1, desired);
+    s.droneCount = static_cast<uint8_t>(droneVoicing(s.droneNotes, partVoices(1)));
     for (int i = 0; i < s.droneCount; ++i)
         synthNote(true, s.droneNotes[i], kVelDrone, kChDrone);
+    if (capturing(1))
+    {
+        // Lowest first, for the Chord FX.
+        int16_t sorted[3];
+        memcpy(sorted, s.droneNotes, sizeof(sorted));
+        for (int i = 1; i < s.droneCount; ++i)
+            for (int j = i; j > 0 && sorted[j - 1] > sorted[j]; --j)
+                std::swap(sorted[j - 1], sorted[j]);
+        ndlrCapture::chord(1, capturePulse(pulse), sorted, s.droneCount, kVelDrone);
+    }
 }
 
 static uint32_t droneInterval()
@@ -671,7 +769,7 @@ static uint32_t droneInterval()
 
 static void restartDrone(uint32_t pulse = s.pulse)
 {
-    voiceDrone();
+    voiceDrone(pulse);
     s.droneNext = pulse + droneInterval();
 }
 
@@ -728,8 +826,13 @@ static void setLaunchDeadline()
     s.launchPulse = s.pulse + grid - s.barPulse % grid;
 }
 
+static void finishCapture(bool complete);
+
 static void queueTrackerRestart()
 {
+    if (s.capState == capRunning)
+        finishCapture(false);
+    s.capLastPos = UINT32_MAX;
     const uint8_t requested = playingParts() ^ s.pendingPartToggles;
     allNotesOff();
     memset(s.partOn, 0, sizeof(s.partOn));
@@ -758,12 +861,12 @@ static void applyLaunch(uint32_t pulse)
 
     if ((changed & 1) && !s.partOn[0])
     {
-        releasePad();
+        releasePad(pulse);
         P->reserveVoices(0, 0);
     }
     if ((changed & 2) && !s.partOn[1])
     {
-        releaseDrone();
+        releaseDrone(pulse);
         P->reserveVoices(1, 0);
     }
     for (int index = 0; index < 2; ++index)
@@ -1036,15 +1139,19 @@ static void tickMotif(int index)
     if (value == kTie)
         return; // the held note carries on
     releaseMotif(index);
-    if (value == kRest || s.voices[index + 2] == 0)
+    if (value == kRest || partVoices(index + 2) == 0)
         return;
 
     const int length = effectivePatternLength(index);
     const int position = motifPatternIndex(settings.variation, voice.patternStep++, length);
     voice.pos = static_cast<int8_t>(position);
     const int note = inMidiRange(patternNote(index, settings.patt.notes[position % kPatternNotes]));
-    synthNote(true, note, motifVelocity(index, static_cast<uint8_t>(value), stepStart), kChMotif1 + index);
+    const uint8_t velocity = motifVelocity(index, static_cast<uint8_t>(value), stepStart);
+    synthNote(true, note, velocity, kChMotif1 + index);
     voice.note = static_cast<int16_t>(note);
+    voice.velocity = velocity;
+    if (capturing(index + 2))
+        ndlrCapture::note(index + 2, 0, capturePulse(stepStart), static_cast<int16_t>(note), velocity);
 
     // Hold the note through any ties that follow it.
     uint32_t ties = 0;
@@ -1145,8 +1252,170 @@ static void seqTick()
         seqAdvance(s.seqNext);
 }
 
+//==============================================================================================
+// Capture into the pattern
+//==============================================================================================
+// The tracks each part writes to, from CAP TRK on. Returns false when they run past the last track.
+static bool captureLayout(ndlrCapture::PartLayout (&layout)[ndlrCapture::kParts])
+{
+    const uint8_t parts = kCaptureParts[s.capParts];
+    const uint8_t counts[4] = { s.padTracks, kDroneTracks, 1, 1 };
+    int track = s.capTrack;
+    for (int part = 0; part < 4; ++part)
+    {
+        layout[part] = { -1, 0, 0 };
+        if (!(parts >> part & 1))
+            continue;
+        const int instrument = external(part) ? MIDI_INSTRUMENTS_START_IDX + s.partOut[part] - 1
+                                              : SYNTH_INSTRUMENTS_START_IDX + part;
+        layout[part] = { static_cast<int8_t>(track), counts[part], static_cast<uint8_t>(instrument) };
+        track += counts[part];
+    }
+    return track <= kAllTracks;
+}
+
+static int captureLastTrack()
+{
+    ndlrCapture::PartLayout layout[ndlrCapture::kParts];
+    captureLayout(layout);
+    int last = s.capTrack;
+    for (const auto& part : layout)
+        if (part.firstTrack >= 0)
+            last = part.firstTrack + part.tracks - 1;
+    return last;
+}
+
+static void startCapture(uint32_t position)
+{
+    ndlrCapture::PartLayout layout[ndlrCapture::kParts];
+    captureLayout(layout);
+    DISABLE_AUDIO_INTERRUPTS();
+    const auto steps = static_cast<uint16_t>(sequencer.getPatternLength());
+    ENABLE_AUDIO_INTERRUPTS();
+    ndlrCapture::begin(layout, steps);
+    s.capState = capRunning;
+    s.capStart = s.pulse - position;
+    s.capLength = steps * kPulsesPerStep;
+    s.capPattern = mtProject.values.actualPattern;
+
+    // Notes still sounding from before the pattern started go on its first step.
+    if (capturing(0) && s.padPlayed)
+    {
+        if (strumOnTracks())
+            for (int i = 0; i < s.padPlayed; ++i)
+                ndlrCapture::note(0, i, 0, s.padNotes[i], kVelPad);
+        else
+            ndlrCapture::chord(0, 0, s.padNotes, s.padPlayed, kVelPad);
+    }
+    if (capturing(1) && s.droneCount)
+    {
+        int16_t sorted[3];
+        memcpy(sorted, s.droneNotes, sizeof(sorted));
+        std::sort(sorted, sorted + s.droneCount);
+        ndlrCapture::chord(1, 0, sorted, s.droneCount, kVelDrone);
+    }
+    for (int index = 0; index < 2; ++index)
+    {
+        const auto& voice = s.motifPlayback[index];
+        if (capturing(index + 2) && voice.note >= 0)
+            ndlrCapture::note(index + 2, 0, 0, voice.note, voice.velocity);
+    }
+    toast("Capturing the pattern");
+}
+
+static void finishCapture(bool complete)
+{
+    const uint8_t parts = kCaptureParts[s.capParts];
+    const auto result = ndlrCapture::finish();
+    s.capState = capOff;
+    if (!complete)
+    {
+        toast("Capture stopped early");
+        return;
+    }
+
+    // The pattern plays the parts from here, so the panel stops playing them.
+    for (int part = 0; part < 4; ++part)
+    {
+        if (!(parts >> part & 1))
+            continue;
+        s.partOn[part] = 0;
+        s.pendingPartToggles &= ~(1u << part);
+        if (part == 0)
+            releasePad();
+        else if (part == 1)
+            releaseDrone();
+        else
+            releaseMotif(part - 2);
+        P->reserveVoices(part, 0);
+    }
+    char text[32];
+    if (result.dropped)
+        snprintf(text, sizeof(text), "Captured, %u notes left out", unsigned(result.dropped));
+    else
+        snprintf(text, sizeof(text), "Captured %u notes", unsigned(result.notes));
+    toast(text);
+}
+
+static void toggleCapture()
+{
+    if (s.capState == capRunning)
+    {
+        finishCapture(false);
+        return;
+    }
+    if (s.capState == capArmed)
+    {
+        s.capState = capOff;
+        toast("Capture off");
+        return;
+    }
+    ndlrCapture::PartLayout layout[ndlrCapture::kParts];
+    if (!captureLayout(layout))
+    {
+        toast("Too many tracks: lower CAP TRK");
+        return;
+    }
+    s.capState = capArmed;
+    s.capLastPos = UINT32_MAX;
+    toast(s.trackerClock ? "Armed: starts with the pattern" : "Armed: press Play");
+}
+
+// Runs before the parts so that notes on the pattern's first step are written.
+static void captureTick()
+{
+    if (s.capState == capOff)
+        return;
+    if (!s.trackerClock)
+    {
+        if (s.capState == capRunning)
+            finishCapture(false);
+        s.capLastPos = UINT32_MAX;
+        return;
+    }
+    if (s.capState == capRunning)
+    {
+        if (mtProject.values.actualPattern != s.capPattern)
+            finishCapture(false);
+        else if (due(s.pulse, s.capStart + s.capLength))
+            finishCapture(true);
+        return;
+    }
+
+    DISABLE_AUDIO_INTERRUPTS();
+    const uint32_t length = sequencer.getPatternLength() * kPulsesPerStep;
+    ENABLE_AUDIO_INTERRUPTS();
+    const uint32_t position = s.trackerPos % length;
+    const bool wrapped = s.capLastPos != UINT32_MAX && position < s.capLastPos;
+    s.capLastPos = position;
+    // Start on a pattern start with a captured part playing, so the pass is not silent.
+    if (wrapped && (playingParts() & kCaptureParts[s.capParts]))
+        startCapture(position);
+}
+
 static void musicTick()
 {
+    captureTick();
     updateLaunch();
     seqTick();
     playPadNotes();
@@ -1168,41 +1437,41 @@ static const char* const kModeHeader[] = { "PRESS / TURN", "+ SHIFT", "IN MENU M
 static const strInfo kInfo[ndlrControlCount] = {
     /* E1 */ { "Enc 1 - PAD", 3,
               { { imNormal, "Turn: Pad POSITION / STRUM. Press: switch between the two." },
-                { imMenu, "Mod Matrix menu 1&2." },
+                { imMenu, "PAD OUT: turn for Synth 1 or MIDI channel 1-16." },
                 { imEditor, "Chord Sequencer." }, { 0, "" } },
               "Position sets the octave. Strum spreads each new chord across the beat, from Off to an eighth-note interval." },
     /* E2 */ { "Enc 2 - PAD", 2,
               { { imNormal, "Turn: Pad RANGE / SPREAD. Press: switch between the two." },
-                { imMenu, "Mod Matrix menu 3&4." }, { 0, "" }, { 0, "" } },
+                { imMenu, "DRN OUT: turn for Synth 2 or MIDI channel 1-16." }, { 0, "" }, { 0, "" } },
               "Range sets the note count, limited by available Synth 1 voices. Auto follows the chord. Spread changes the voicing." },
     /* E3 */ { "Enc 3 - DRONE", 2,
               { { imNormal, "Turn: Drone POSITION / NOTES / TRIGGER. Press: cycle the three." },
-                { imMenu, "Mod Matrix menu 5&6." }, { 0, "" }, { 0, "" } },
+                { imMenu, "M1 OUT: turn for Synth 3 or MIDI channel 1-16." }, { 0, "" }, { 0, "" } },
               "Notes adds a fifth or octave when voices are available. Trigger follows the chord or holds the key root, with optional repeats." },
     /* E4 */ { "Enc 4 - T-K-M", 4,
               { { imNormal, "Press to cycle Tempo, Key, Mode, Quantise and Clock. Turn to adjust." },
                 { imShift, "Physical Shift + +/- controls the Mini's master volume." },
-                { imMenu, "Mod Matrix menu 7&8." },
+                { imMenu, "M2 OUT: turn for Synth 4 or MIDI channel 1-16." },
                 { imEditor, "MIDI Controller editor." } },
               "The keyboard shows the notes of the key and mode, with the chord in green. Tracker follows "
               "the running pattern. Internal uses NDLR tempo." },
     /* E5 */ { "Enc 5 - MOTIF", 3,
               { { imNormal, "Turn: Motif POSITION / PATT-LEN for the selected motif." },
-                { imMenu, "LFO Config." }, { imEditor, "Pattern Editor." }, { 0, "" } },
+                { imMenu, "CAPTURE: turn to pick the parts. Press to arm or stop." }, { imEditor, "Pattern Editor." }, { 0, "" } },
               "Position sets the octave. Pattern Length sets 1 to 16 notes, or Auto to follow the preset length." },
     /* E6 */ { "Enc 6 - MOTIF", 3,
               { { imNormal, "Turn: Motif VARIATION / PATTERN." },
-                { imMenu, "Settings 1/3 (mostly MIDI)." }, { imEditor, "Rhythm Editor." }, { 0, "" } },
+                { imMenu, "CAP TRK: the first track written. Press to arm or stop." }, { imEditor, "Rhythm Editor." }, { 0, "" } },
               "Variation changes playback order. Pattern picks one of forty: 1 to 20 are presets, 21 to 40 "
               "are yours, written in the Pattern Editor." },
     /* E7 */ { "Enc 7 - MOTIF", 3,
               { { imNormal, "Turn: CLK DIV / RHY-LEN. Centre arrow (GATE) is not printed on the panel." },
-                { imMenu, "Settings 2/3 (mostly velocities)." },
+                { imMenu, "PAD TRKS: tracks for the Pad, 1-8. Press to arm or stop." },
                 { imEditor, "Perlin Noise generator." }, { 0, "" } },
               "Clock Division sets the step rate. Rhythm Length sets 4 to 32 steps. Gate sets the percentage of each step that a note sounds." },
     /* E8 */ { "Enc 8 - MOTIF", 2,
               { { imNormal, "Turn: ACCENT / RHYTHM / OFFSET." },
-                { imMenu, "Settings 3/3 (general)." }, { 0, "" }, { 0, "" } },
+                { imMenu, "STRUM: keep a strummed Pad's timing, or play it as one chord." }, { 0, "" }, { 0, "" } },
               "Accent sets the velocities: fixed, the rhythm's own, humanised, or high (o) and low (.) eighth "
               "notes. Rhythm picks one of forty. Offset delays Motif 2 by up to three sixteenths." },
     /* ALL */ { "ALL  ||/>", 2,
@@ -1227,7 +1496,7 @@ static const strInfo kInfo[ndlrControlCount] = {
                   "Shows key and mode, BPM, chord degree + name + type, and the four play indicators. "
                   "The larger sub screen on the right follows the dial in use: Pad, Drone, T-K-M or Motif." },
     /* MENU */ { "MENU / EDITORS", 3,
-                { { imNormal, "Toggle Menu mode: the eight encoder buttons then open menus." },
+                { { imNormal, "Toggle Menu mode: dials 1-4 set where the parts play, dials 5-8 capture." },
                   { imShift, "Toggle Editor mode. The last editor used is shown." },
                   { imBoot, "At power-on, Shift+Menu opens the Boot Menu." }, { 0, "" } },
                 "Editors: Chord Sequencer on dial 1, Pattern Editor on dial 5, Rhythm Editor on dial 6. In "
@@ -1241,21 +1510,21 @@ static const strInfo kInfo[ndlrControlCount] = {
     /* PAD */ { "PAD  ||/>", 2,
                { { imNormal, "Play / pause the Pad." },
                  { imShift, "MOD: toggle modulations that target the Pad (red ring)." }, { 0, "" }, { 0, "" } },
-               "Pad plays every note of the current chord. Plays on Tracker synth channel 1." },
+               "Pad plays every note of the current chord, on Synth 1 or the MIDI channel set in Menu mode." },
     /* DRONE */ { "DRONE  ||/>", 2,
                  { { imNormal, "Play / pause the Drone." },
                    { imShift, "MOD: toggle modulations that target the Drone (red ring)." }, { 0, "" }, { 0, "" } },
-                 "Drone can hold the chord or key root. Plays on Tracker synth channel 2." },
+                 "Drone can hold the chord or key root, on Synth 2 or the MIDI channel set in Menu mode." },
     /* M1 */ { "MOTIF 1  ||/>", 2,
                { { imNormal, "Play / pause Motif 1 (up arpeggio)." },
                  { imShift, "MOD: toggle modulations that target Motif 1 (red ring)." }, { 0, "" }, { 0, "" } },
                "Defaults to an ascending eighth-note arpeggio. A paused motif carries on from where it "
-               "stopped; ALL restarts both. Plays on Tracker synth channel 3." },
+               "stopped; ALL restarts both. Plays on Synth 3 or the MIDI channel set in Menu mode." },
     /* M2 */ { "MOTIF 2  ||/>", 2,
                { { imNormal, "Play / pause Motif 2 (down arpeggio)." },
                  { imShift, "MOD: toggle modulations that target Motif 2 (red ring)." }, { 0, "" }, { 0, "" } },
-               "Defaults to a descending quarter-note arpeggio on Tracker Synth 4. A paused motif carries "
-               "on from where it stopped; ALL restarts both." },
+               "Defaults to a descending quarter-note arpeggio on Synth 4 or the MIDI channel set in Menu "
+               "mode. A paused motif carries on from where it stopped; ALL restarts both." },
     /* REC */ { "RECORD", 1,
                 { { imNormal, "Press Middle to start or stop recording." } },
                 "Saves the stereo mix, including the Tracker pattern, to Recordings on the SD card." },
@@ -1850,6 +2119,9 @@ static void editorValue(char* text, size_t size, int e)
     }
 }
 
+static void menuValue(char* text, size_t size, int enc);
+static int16_t menuAngle(int enc);
+
 static void rebuildView()
 {
     strNdlrPanelView& v = s_view;
@@ -1866,7 +2138,7 @@ static void rebuildView()
     for (int i = 0; i < 8; i++)
     {
         v.encLabel[i] = s.encLabel[i];
-        v.encAngle[i] = encoderAngle(i);
+        v.encAngle[i] = s.menuMode == 1 ? menuAngle(i) : encoderAngle(i);
     }
     v.chordDegree = s.degree;
     v.queuedChord = s.queuedChord;
@@ -1882,6 +2154,8 @@ static void rebuildView()
     memcpy(v.toast, s.toast, sizeof(v.toast));
     if (hasQueuedLaunch() && !(s.recordToast && v.toast[0]))
         snprintf(v.toast, sizeof(v.toast), "Queued for %s", s.quantise == 2 ? "next bar" : "next beat");
+    else if (!v.toast[0] && s.capState != capOff)
+        snprintf(v.toast, sizeof(v.toast), "%s", s.capState == capArmed ? "CAPTURE ARMED" : "CAPTURING");
     snprintf(v.chordText, sizeof(v.chordText), "%s %s", roman, name);
     snprintf(v.typeText, sizeof(v.typeText), "%s",
              s.pendingType >= 0 ? kTypeName[s.pendingType] : kTypeName[resolvedType()]);
@@ -1970,6 +2244,8 @@ static void rebuildView()
     if (s.menuMode == 2)
         snprintf(v.detailText, sizeof(v.detailText), "%s",
                  s.editor == ndlrEnc6 ? "RHY EDITOR" : s.editor == ndlrEnc1 ? "CHORD SEQ" : "PATT EDITOR");
+    else if (s.menuMode == 1)
+        menuValue(v.detailText, sizeof(v.detailText), enc);
     else
         encoderValue(v.detailText, sizeof(v.detailText), enc);
 
@@ -1980,6 +2256,12 @@ static void rebuildView()
         editorValue(now, sizeof(now), dial);
     else if (g.kind == ndlrKindEnc && s.menuMode == 0)
         encoderValue(now, sizeof(now), s.sel - ndlrEnc1);
+    else if (g.kind == ndlrKindEnc && s.menuMode == 1)
+    {
+        char value[24];
+        menuValue(value, sizeof(value), s.sel - ndlrEnc1);
+        snprintf(now, sizeof(now), "Now: %s", value);
+    }
     else if (g.kind == ndlrKindChord || g.kind == ndlrKindScreen)
         snprintf(now, sizeof(now), "Now: %s %s %s", roman, name, kTypeName[resolvedType()]);
     else if (s.sel == ndlrBtnMotifSel)
@@ -2220,7 +2502,10 @@ static void pressSelected()
             s.activeEnc = e;
             if (s.menuMode == 1)
             {
-                toast("Menu screens: not in this build");
+                if (e >= 4)
+                    toggleCapture();
+                else
+                    toast("Turn to pick Synth or MIDI ch");
             }
             else if (s.menuMode == 2)
             {
@@ -2494,6 +2779,92 @@ static void editorTurn(int e, int n)
     }
 }
 
+//==============================================================================================
+// Menu mode: outputs on dials 1-4, capture on dials 5-8
+//==============================================================================================
+static void menuValue(char* text, size_t size, int enc)
+{
+    switch (enc)
+    {
+        case 0:
+        case 1:
+        case 2:
+        case 3:
+            if (external(enc)) snprintf(text, size, "MIDI ch %u", unsigned(s.partOut[enc]));
+            else snprintf(text, size, "Synth %d", enc + 1);
+            break;
+        case 4:
+            if (s.capState == capArmed) snprintf(text, size, "Armed");
+            else if (s.capState == capRunning) snprintf(text, size, "Capturing");
+            else snprintf(text, size, "%s", kCaptureNames[s.capParts]);
+            break;
+        case 5:
+            snprintf(text, size, "Tracks %u-%d", unsigned(s.capTrack + 1), captureLastTrack() + 1);
+            break;
+        case 6: snprintf(text, size, "Pad %u tracks", unsigned(s.padTracks)); break;
+        default: snprintf(text, size, "Strum %s", s.strumKeep ? "kept" : "ignored"); break;
+    }
+}
+
+static int16_t menuAngle(int enc)
+{
+    switch (enc)
+    {
+        case 0:
+        case 1:
+        case 2:
+        case 3: return dialAngle(s.partOut[enc], 0, kMidiChannels);
+        case 4: return optionAngle(s.capParts, kCaptureNames);
+        case 5: return dialAngle(s.capTrack, 0, kAllTracks - 1);
+        case 6: return dialAngle(s.padTracks, 1, kMaxPadTracks);
+        default: return dialAngle(s.strumKeep, 0, 1);
+    }
+}
+
+// Changing where a part plays ends its notes first, so none is left hanging on the old output.
+static void setOutput(int part, int dir)
+{
+    uint8_t out = s.partOut[part];
+    if (!adjust(out, dir, 0, kMidiChannels))
+        return;
+    if (part == 0)
+        releasePad();
+    else if (part == 1)
+        releaseDrone();
+    else
+        releaseMotif(part - 2);
+    s.partOut[part] = out;
+    P->reserveVoices(part, 0);
+    if (part == 0 && s.partOn[0])
+        voicePad();
+    else if (part == 1 && s.partOn[1])
+        voiceDrone();
+    if (out && mtConfig.midi.notesOutMode == notesOut_mode_None)
+        toast("Turn on Config > MIDI notes out");
+}
+
+static void menuTurn(int e, int dir)
+{
+    if (e < 4)
+    {
+        setOutput(e, dir);
+        return;
+    }
+    if (s.capState != capOff)
+    {
+        toast("Stop the capture first");
+        return;
+    }
+    if (e == 4)
+        cycle(s.capParts, dir, kCaptureNames);
+    else if (e == 5)
+        adjust(s.capTrack, dir, 0, kAllTracks - 1);
+    else if (e == 6)
+        adjust(s.padTracks, dir, 1, kMaxPadTracks);
+    else
+        s.strumKeep = !s.strumKeep;
+}
+
 static void turn(int n)
 {
     if (kNdlrGeom[s.sel].kind != ndlrKindEnc)
@@ -2501,12 +2872,6 @@ static void turn(int n)
         toast("Select an encoder to turn it");
         return;
     }
-    if (s.menuMode == 1)
-    {
-        toast("Leave Menu mode");
-        return;
-    }
-
     const uint32_t now = nowMs();
     advanceClock(now);
     updateLaunch();
@@ -2520,6 +2885,12 @@ static void turn(int n)
     if (s.menuMode == 2)
     {
         editorTurn(e, n);
+        s.dirty = 1;
+        return;
+    }
+    if (s.menuMode == 1)
+    {
+        menuTurn(e, dir);
         s.dirty = 1;
         return;
     }
@@ -2727,8 +3098,21 @@ void cNdlrPanel::start(uint32_t options)
 void cNdlrPanel::resetSession()
 {
     const bool internalClock = s.internalClock;
+    uint8_t partOut[4];
+    memcpy(partOut, s.partOut, sizeof(partOut));
+    const uint8_t capParts = s.capParts, capTrack = s.capTrack, padTracks = s.padTracks;
+    const bool strumKeep = s.strumKeep;
+    if (s.capState == capRunning)
+        ndlrCapture::finish();
     memset(&s, 0, sizeof(s));
     s.internalClock = internalClock;
+    memcpy(s.partOut, partOut, sizeof(partOut));
+    s.capParts = capParts;
+    // Tracks 9 on are the MIDI tracks, often free beside the sample tracks.
+    s.capTrack = padTracks ? capTrack : 8;
+    s.padTracks = padTracks ? padTracks : 2;
+    s.strumKeep = padTracks ? strumKeep : true;
+    s.capLastPos = UINT32_MAX;
     memset(&s_view, 0, sizeof(s_view));
     s.sel = ndlrEnc1;
     s.motif = 1;
@@ -2781,6 +3165,9 @@ void cNdlrPanel::endSession()
 {
     if (!sessionActive)
         return;
+    if (s.capState == capRunning)
+        finishCapture(false);
+    s.capState = capOff;
     sessionActive = false;
     s.pendingPartToggles = 0;
     s.queuedChord = 0;
