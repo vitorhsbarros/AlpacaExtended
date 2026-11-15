@@ -129,9 +129,16 @@ uint8_t chordFxFor(const int16_t* notes, int count)
     return bestShape(intervalMask(notes, count), true);
 }
 
-void begin(const PartLayout (&layout)[kParts], uint16_t steps)
+void begin(const PartLayout (&layout)[kParts], uint16_t steps, bool setLength)
 {
     newFileManager.storePatternUndoRevision();
+    if (setLength && steps > 0 && steps <= Sequencer::MAXSTEP + 1)
+    {
+        DISABLE_AUDIO_INTERRUPTS();
+        for (auto& track : sequencer.getActualPattern()->track)
+            track.length = static_cast<uint8_t>(steps - 1);
+        ENABLE_AUDIO_INTERRUPTS();
+    }
     st = State{};
     st.active = true;
     st.steps = steps;

@@ -19,7 +19,7 @@ int main(){
   CHECK(chordFxFor(wide,5)==0);
   memset(&sequencer.pattern, 0x55, sizeof(sequencer.pattern));
   PartLayout layout[4] = { {8,2,68}, {10,2,69}, {12,1,70}, {13,1,71} };
-  begin(layout, 32);
+  begin(layout, 32, false);
   CHECK(newFileManager.undo==1);
   CHECK(T(8).step[0].note==-1 && T(13).step[31].note==-1 && T(14).step[0].note==0x55); // only own tracks cleared
   // pad chord at step 0 -> one track with chord FX
@@ -55,5 +55,9 @@ int main(){
   printf("notes %u dropped %u\n", r.notes, r.dropped);
   CHECK(r.dropped==2); // one from wide chord + slot2 of strum
   CHECK(patternEditor.refresh==1);
+  // fitting the length sets every track
+  begin(layout, 48, true);
+  CHECK(T(0).length==47 && T(15).length==47);
+  finish();
   printf(fails? "FAILED %d\n":"ALL OK\n", fails); return fails;
 }

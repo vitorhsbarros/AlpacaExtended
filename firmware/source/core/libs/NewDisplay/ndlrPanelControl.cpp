@@ -61,7 +61,7 @@ static const char* const kEncLabel[8][5] = {
     { "DIV", "R-LEN", "GATE" },  { "ACCNT", "RHY", "OFFS" },
 };
 static const char* const kEncMenuName[8] = { "PAD OUT", "DRN OUT", "M1 OUT", "M2 OUT",
-                                             "CAPTURE", "CAP TRK", "PAD TRKS", "STRUM" };
+                                             "CAPTURE", "CAP TRK", "PAD TRKS", "STRM/LEN" };
 static const char* const kEncEditorName[8] = { "CHORD SEQ", "",       "",       "MIDI CTL",
                                                "PATT ED",   "RHY ED", "PERLIN", "" };
 

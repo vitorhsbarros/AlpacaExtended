@@ -416,6 +416,8 @@ struct strState
     uint8_t capTrack;     // first track, 0-15
     uint8_t padTracks;    // tracks for the Pad, 1-8
     bool strumKeep;       // a strummed Pad keeps its timing, one note per track
+    bool capFit;          // capture sets the pattern to the parts' cycle length
+    uint8_t menuDial8;    // what dial 8 turns in Menu mode: 0 strum, 1 length
     uint8_t capState;
     uint8_t capPattern;   // the pattern being written
     uint32_t capStart;    // the pulse of the pattern's first step
@@ -1257,6 +1259,68 @@ static void seqTick()
 //==============================================================================================
 // Capture into the pattern
 //==============================================================================================
+static uint32_t gcdOf(uint32_t a, uint32_t b)
+{
+    while (b)
+    {
+        const uint32_t r = a % b;
+        a = b;
+        b = r;
+    }
+    return a;
+}
+
+// Least common multiple, held at `kCycleCap` so a long cycle cannot overflow.
+static constexpr uint32_t kCycleCap = 1u << 24;
+static uint32_t lcmOf(uint32_t a, uint32_t b)
+{
+    if (a == 0 || b == 0)
+        return a | b;
+    const uint64_t value = uint64_t(a / gcdOf(a, b)) * b;
+    return value > kCycleCap ? kCycleCap : static_cast<uint32_t>(value);
+}
+
+// How long a motif takes, in pulses, to come back to the same rhythm beat and pattern note.
+// A random variation never repeats, so only its rhythm counts.
+static uint32_t motifCycle(int index)
+{
+    const auto& m = s.motifSettings[index];
+    const uint32_t rhythm = m.rhythmLength * kDivisionPulses[m.division];
+    const int notes = noteBeats(index);
+    if (notes == 0 || m.variation == 5)
+        return rhythm;
+    const int length = effectivePatternLength(index);
+    const int period = m.variation == 2 ? (length > 1 ? 2 * length - 2 : 1) : m.variation == 3 ? 2 * length : length;
+    return rhythm * (period / gcdOf(period, notes));
+}
+
+// The steps the captured parts need before they repeat: whole bars, the motifs' cycles, the
+// Drone's repeats and an armed Chord Sequencer's song.
+static uint32_t cycleSteps()
+{
+    const uint8_t parts = kCaptureParts[s.capParts];
+    uint32_t pulses = kPulsesPerBar;
+    if ((parts & 2) && s.droneTrigger % 4 != 0)
+        pulses = lcmOf(pulses, droneInterval());
+    for (int index = 0; index < 2; ++index)
+        if (parts & (4 << index))
+            pulses = lcmOf(pulses, motifCycle(index));
+    if (s.seqArmed || s.seqRunning)
+    {
+        int slot = 0, section = 0, step = 0;
+        const int count = seqPlaylist(-1, &slot, &section, &step);
+        uint32_t song = 0;
+        for (int i = 0; i < count; ++i)
+        {
+            seqPlaylist(i, &slot, &section, &step);
+            song += s.seq.sections[section][step].dur * (kPulsesPerBeat / 2);
+        }
+        pulses = lcmOf(pulses, song);
+    }
+    return pulses / kPulsesPerStep;
+}
+
+static constexpr uint32_t kMaxPatternSteps = Sequencer::MAXSTEP + 1;
 // The tracks each part writes to, from CAP TRK on. Returns false when they run past the last track.
 static bool captureLayout(ndlrCapture::PartLayout (&layout)[ndlrCapture::kParts])
 {
@@ -1292,9 +1356,12 @@ static void startCapture(uint32_t position)
     ndlrCapture::PartLayout layout[ndlrCapture::kParts];
     captureLayout(layout);
     DISABLE_AUDIO_INTERRUPTS();
-    const auto steps = static_cast<uint16_t>(sequencer.getPatternLength());
+    auto steps = static_cast<uint16_t>(sequencer.getPatternLength());
     ENABLE_AUDIO_INTERRUPTS();
-    ndlrCapture::begin(layout, steps);
+    const uint32_t cycle = cycleSteps();
+    if (s.capFit)
+        steps = static_cast<uint16_t>(cycle < kMaxPatternSteps ? cycle : kMaxPatternSteps);
+    ndlrCapture::begin(layout, steps, s.capFit);
     s.capState = capRunning;
     s.capStart = s.pulse - position;
     s.capLength = steps * kPulsesPerStep;
@@ -1322,7 +1389,10 @@ static void startCapture(uint32_t position)
         if (capturing(index + 2) && voice.note >= 0)
             ndlrCapture::note(index + 2, 0, 0, voice.note, voice.velocity);
     }
-    toast("Capturing the pattern");
+    if (s.capFit && cycle > kMaxPatternSteps)
+        toast("Cycle too long: using 128 steps");
+    else
+        toast("Capturing the pattern");
 }
 
 static void finishCapture(bool complete)
@@ -1478,7 +1548,7 @@ static const strInfo kInfo[ndlrControlCount] = {
               "Clock Division sets the step rate. Rhythm Length sets 4 to 32 steps. Gate sets the percentage of each step that a note sounds." },
     /* E8 */ { "Enc 8 - MOTIF", 2,
               { { imNormal, "Turn: ACCENT / RHYTHM / OFFSET." },
-                { imMenu, "STRUM: keep a strummed Pad's timing, or play it as one chord." }, { 0, "" }, { 0, "" } },
+                { imMenu, "STRUM: keep a strummed Pad's timing, or play it as one chord. Press: LENGTH, keep the pattern's or fit it to the parts' cycle." }, { 0, "" }, { 0, "" } },
               "Accent sets the velocities: fixed, the rhythm's own, humanised, or high (o) and low (.) eighth "
               "notes. Rhythm picks one of forty. Offset delays Motif 2 by up to three sixteenths." },
     /* ALL */ { "ALL  ||/>", 2,
@@ -2509,7 +2579,9 @@ static void pressSelected()
             s.activeEnc = e;
             if (s.menuMode == 1)
             {
-                if (e >= 4)
+                if (e == 7)
+                    s.menuDial8 ^= 1; // dial 8 turns the strum or the pattern length
+                else if (e >= 4)
                     toggleCapture();
                 else
                     toast("Turn to pick Synth or MIDI ch");
@@ -2809,7 +2881,21 @@ static void menuValue(char* text, size_t size, int enc)
             snprintf(text, size, "Tracks %u-%d", unsigned(s.capTrack + 1), captureLastTrack() + 1);
             break;
         case 6: snprintf(text, size, "Pad %u tracks", unsigned(s.padTracks)); break;
-        default: snprintf(text, size, "Strum %s", s.strumKeep ? "kept" : "ignored"); break;
+        default:
+            if (s.menuDial8 == 0)
+                snprintf(text, size, "Strum %s", s.strumKeep ? "kept" : "ignored");
+            else
+            {
+                DISABLE_AUDIO_INTERRUPTS();
+                const unsigned length = sequencer.getPatternLength();
+                ENABLE_AUDIO_INTERRUPTS();
+                const unsigned cycle = cycleSteps();
+                if (s.capFit && cycle > kMaxPatternSteps) snprintf(text, size, "Fit: 128 (%s)", ">128");
+                else if (s.capFit) snprintf(text, size, "Fit: %u steps", cycle);
+                else if (cycle > kMaxPatternSteps) snprintf(text, size, "Keep %u (>128)", length);
+                else snprintf(text, size, "Keep %u (of %u)", length, cycle);
+            }
+            break;
     }
 }
 
@@ -2824,7 +2910,7 @@ static int16_t menuAngle(int enc)
         case 4: return optionAngle(s.capParts, kCaptureNames);
         case 5: return dialAngle(s.capTrack, 0, kAllTracks - 1);
         case 6: return dialAngle(s.padTracks, 1, kMaxPadTracks);
-        default: return dialAngle(s.strumKeep, 0, 1);
+        default: return dialAngle(s.menuDial8 == 0 ? s.strumKeep : s.capFit, 0, 1);
     }
 }
 
@@ -2868,8 +2954,10 @@ static void menuTurn(int e, int dir)
         adjust(s.capTrack, dir, 0, kAllTracks - 1);
     else if (e == 6)
         adjust(s.padTracks, dir, 1, kMaxPadTracks);
-    else
+    else if (s.menuDial8 == 0)
         s.strumKeep = !s.strumKeep;
+    else
+        s.capFit = !s.capFit;
 }
 
 static void turn(int n)
@@ -3108,7 +3196,7 @@ void cNdlrPanel::resetSession()
     uint8_t partOut[4];
     memcpy(partOut, s.partOut, sizeof(partOut));
     const uint8_t capParts = s.capParts, capTrack = s.capTrack, padTracks = s.padTracks;
-    const bool strumKeep = s.strumKeep;
+    const bool strumKeep = s.strumKeep, capFit = s.capFit;
     if (s.capState == capRunning)
         ndlrCapture::finish();
     memset(&s, 0, sizeof(s));
@@ -3119,6 +3207,7 @@ void cNdlrPanel::resetSession()
     s.capTrack = padTracks ? capTrack : 8;
     s.padTracks = padTracks ? padTracks : 2;
     s.strumKeep = padTracks ? strumKeep : true;
+    s.capFit = capFit;
     s.capLastPos = UINT32_MAX;
     memset(&s_view, 0, sizeof(s_view));
     s.sel = ndlrEnc1;

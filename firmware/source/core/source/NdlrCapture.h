@@ -29,8 +29,9 @@ struct Result
     uint16_t dropped; // notes that did not fit on the part's tracks
 };
 
-// Clears the parts' tracks in the current pattern, after storing an undo revision.
-void begin(const PartLayout (&layout)[kParts], uint16_t steps);
+// Clears the parts' tracks in the current pattern, after storing an undo revision. With
+// `setLength` the pattern is first set to `steps` long.
+void begin(const PartLayout (&layout)[kParts], uint16_t steps, bool setLength);
 bool active();
 
 // Notes that start together. Sorted lowest first.

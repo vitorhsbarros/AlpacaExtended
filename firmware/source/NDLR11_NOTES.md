@@ -56,7 +56,7 @@ Press MENU to enter Menu mode. The dials then do this:
 | 5 | CAPTURE | Parts to capture: all, one, both motifs, or Pad + Drone | Arm or stop the capture |
 | 6 | CAP TRK | The first track written (default 9) | Arm or stop |
 | 7 | PAD TRKS | Tracks for the Pad, 1-8 (default 2) | Arm or stop |
-| 8 | STRUM | Keep a strummed Pad's timing, or ignore the strum | Arm or stop |
+| 8 | STRM/LEN | STRUM: keep a strummed Pad's timing, or ignore the strum. LENGTH: keep the pattern's length, or fit it to the parts' cycle | Switch between STRUM and LENGTH |
 
 - **MIDI out.** A part set to a MIDI channel goes out through the Tracker's MIDI out, so set
   Config > MIDI > Notes out to USB, Jack or both. The Tracker's middle C setting applies. A part on
@@ -69,6 +69,12 @@ Press MENU to enter Menu mode. The dials then do this:
   - With the Tracker playing the pattern and the panel on CLK:Trk: it starts when the pattern
     starts again with a captured part playing, and then stops the captured parts so the pattern
     plays them.
+- **Cycle length.** LENGTH shows how many steps the captured parts take to repeat: whole bars, each
+  motif until its rhythm and pattern line up again (a Random variation counts its rhythm only),
+  the Drone's repeats, and an armed Chord Sequencer's whole song. "Keep 32 (of 96)" means the
+  pattern is 32 steps and a full cycle is 96. With "Fit" the capture sets the pattern to the
+  cycle first, up to 128 steps. The cycle follows the chord too: an Auto pattern length is twice
+  the chord's notes, so a 7th chord makes a longer cycle than a triad.
 - Tracks are given out in order from CAP TRK: the Pad gets PAD TRKS tracks, the Drone two, each
   motif one. The tracks are cleared first. Each note uses the part's instrument: its synth, or the
   MIDI instrument of its channel.
