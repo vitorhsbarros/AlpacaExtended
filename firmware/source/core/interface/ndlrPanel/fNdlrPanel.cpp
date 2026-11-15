@@ -420,7 +420,8 @@ struct strState
     uint8_t capPattern;   // the pattern being written
     uint32_t capStart;    // the pulse of the pattern's first step
     uint32_t capLength;   // the pattern's length in pulses
-    uint32_t capLastPos;  // where in the pattern the previous frame was, to see it wrap
+    uint32_t capLastPos;  // where in the pattern (or bar) the previous frame was, to see it wrap
+    bool capWithTracker;  // the capture follows the Tracker's playback, not the panel's clock
     uint32_t trackerPos;  // the Tracker's position in pulses from its first step, with s.pulse
 };
 
@@ -574,6 +575,7 @@ static void advanceClock(uint32_t now)
     if (s.trackerClock)
     {
         s.trackerClock = false;
+        s.capLastPos = UINT32_MAX; // the capture now counts bars on the panel's clock
         s.tickPhase = 0;
         if (s.internalClock && s.quantise == 0 && hasQueuedLaunch())
             applyLaunch(s.pulse);
@@ -1334,8 +1336,9 @@ static void finishCapture(bool complete)
         return;
     }
 
-    // The pattern plays the parts from here, so the panel stops playing them.
-    for (int part = 0; part < 4; ++part)
+    // When the Tracker is playing the pattern, it plays the parts from here, so the panel stops
+    // playing them. With the Tracker stopped the parts carry on.
+    for (int part = 0; s.capWithTracker && part < 4; ++part)
     {
         if (!(parts >> part & 1))
             continue;
@@ -1378,39 +1381,43 @@ static void toggleCapture()
     }
     s.capState = capArmed;
     s.capLastPos = UINT32_MAX;
-    toast(s.trackerClock ? "Armed: starts with the pattern" : "Armed: press Play");
+    toast(s.trackerClock ? "Armed: starts with the pattern" : "Armed: starts on the next bar");
 }
 
 // Runs before the parts so that notes on the pattern's first step are written.
+//
+// With the Tracker playing the pattern (and the panel on its clock), the capture starts when the
+// pattern starts again. Otherwise it starts on the panel's next bar, so it works with the
+// Tracker stopped and with the panel's own clock, and the pattern is played back later.
 static void captureTick()
 {
     if (s.capState == capOff)
         return;
-    if (!s.trackerClock)
-    {
-        if (s.capState == capRunning)
-            finishCapture(false);
-        s.capLastPos = UINT32_MAX;
-        return;
-    }
     if (s.capState == capRunning)
     {
-        if (mtProject.values.actualPattern != s.capPattern)
+        if (s.capWithTracker && (!s.trackerClock || mtProject.values.actualPattern != s.capPattern))
             finishCapture(false);
         else if (due(s.pulse, s.capStart + s.capLength))
             finishCapture(true);
         return;
     }
 
-    DISABLE_AUDIO_INTERRUPTS();
-    const uint32_t length = sequencer.getPatternLength() * kPulsesPerStep;
-    ENABLE_AUDIO_INTERRUPTS();
-    const uint32_t position = s.trackerPos % length;
+    uint32_t position = s.barPulse;
+    if (s.trackerClock)
+    {
+        DISABLE_AUDIO_INTERRUPTS();
+        const uint32_t length = sequencer.getPatternLength() * kPulsesPerStep;
+        ENABLE_AUDIO_INTERRUPTS();
+        position = s.trackerPos % length;
+    }
     const bool wrapped = s.capLastPos != UINT32_MAX && position < s.capLastPos;
     s.capLastPos = position;
-    // Start on a pattern start with a captured part playing, so the pass is not silent.
+    // Start with a captured part playing, so the pass is not silent.
     if (wrapped && (playingParts() & kCaptureParts[s.capParts]))
+    {
+        s.capWithTracker = s.trackerClock;
         startCapture(position);
+    }
 }
 
 static void musicTick()

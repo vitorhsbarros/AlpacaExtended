@@ -62,9 +62,13 @@ Press MENU to enter Menu mode. The dials then do this:
   Config > MIDI > Notes out to USB, Jack or both. The Tracker's middle C setting applies. A part on
   MIDI does not use or limit the internal synth's voices. Changing a part's output ends its notes
   first.
-- **Capture.** Arm it with the Tracker playing the pattern, or arm it and press Play. It starts at
-  the next start of the pattern at which a captured part is playing, and writes one pass of the
-  pattern. Then it stops the captured parts so the pattern plays them, and the step can be undone.
+- **Capture.** Press dial 5-8 to arm it. It writes one pattern's length of steps, and the step can
+  be undone.
+  - With the Tracker stopped, or the panel on its own clock: it starts on the panel's next bar
+    with a captured part playing. The parts carry on afterwards.
+  - With the Tracker playing the pattern and the panel on CLK:Trk: it starts when the pattern
+    starts again with a captured part playing, and then stops the captured parts so the pattern
+    plays them.
 - Tracks are given out in order from CAP TRK: the Pad gets PAD TRKS tracks, the Drone two, each
   motif one. The tracks are cleared first. Each note uses the part's instrument: its synth, or the
   MIDI instrument of its channel.
