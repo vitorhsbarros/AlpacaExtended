@@ -119,6 +119,8 @@ void write(int part, int slot, int32_t pulse, int16_t note, uint8_t velocity, ui
 
     st.openStep[track] = index;
     ++st.result.notes;
+    if (index + 1 > st.result.lastStep)
+        st.result.lastStep = static_cast<uint16_t>(index + 1);
 }
 } // namespace
 
@@ -250,6 +252,7 @@ Result finish()
     if (!st.active)
         return {};
     st.active = false;
+    st.result.steps = st.steps;
     newFileManager.setActualPatternStructChanged();
     patternEditor.refreshPatternFromOutsideModule();
     return st.result;

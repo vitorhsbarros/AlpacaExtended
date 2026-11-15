@@ -1426,7 +1426,8 @@ static void finishCapture(bool complete)
     if (result.dropped)
         snprintf(text, sizeof(text), "Captured, %u notes left out", unsigned(result.dropped));
     else
-        snprintf(text, sizeof(text), "Captured %u notes", unsigned(result.notes));
+        snprintf(text, sizeof(text), "%u notes, last step %u/%u", unsigned(result.notes),
+                 unsigned(result.lastStep), unsigned(result.steps));
     toast(text);
 }
 
@@ -1467,8 +1468,6 @@ static void captureTick()
     {
         if (s.capWithTracker && (!s.trackerClock || mtProject.values.actualPattern != s.capPattern))
             finishCapture(false);
-        else if (due(s.pulse, s.capStart + s.capLength))
-            finishCapture(true);
         return;
     }
 
@@ -1490,6 +1489,14 @@ static void captureTick()
     }
 }
 
+// Runs after the parts, so that a frame that arrives a little after the end of the pattern still
+// writes the notes that were due before the end. Notes due after it are not written.
+static void captureEndTick()
+{
+    if (s.capState == capRunning && due(s.pulse, s.capStart + s.capLength))
+        finishCapture(true);
+}
+
 static void musicTick()
 {
     captureTick();
@@ -1503,6 +1510,7 @@ static void musicTick()
     }
     tickMotif(0);
     tickMotif(1);
+    captureEndTick();
 }
 
 //==============================================================================================

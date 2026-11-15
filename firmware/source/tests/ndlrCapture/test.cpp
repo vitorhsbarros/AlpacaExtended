@@ -53,7 +53,8 @@ int main(){
   note(3, 0, 32*12, 60, 80); CHECK(T(13).step[0].note==-1);
   auto r = finish();
   printf("notes %u dropped %u\n", r.notes, r.dropped);
-  CHECK(r.dropped==2); // one from wide chord + slot2 of strum
+  CHECK(r.dropped==2);
+  CHECK(r.lastStep==17 && r.steps==32); // one from wide chord + slot2 of strum
   CHECK(patternEditor.refresh==1);
   // fitting the length sets every track
   begin(layout, 48, true);

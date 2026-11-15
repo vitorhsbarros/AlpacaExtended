@@ -27,6 +27,8 @@ struct Result
 {
     uint16_t notes;   // notes written
     uint16_t dropped; // notes that did not fit on the part's tracks
+    uint16_t lastStep; // the last step written, counted from 1, or zero
+    uint16_t steps;    // the pattern's length
 };
 
 // Clears the parts' tracks in the current pattern, after storing an undo revision. With
