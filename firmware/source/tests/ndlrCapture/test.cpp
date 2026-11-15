@@ -51,6 +51,9 @@ int main(){
   CHECK(T(8).step[16].note==60 && T(9).step[16].note==64 && T(9).step[16].micromove==49);
   // out of range ignored
   note(3, 0, 32*12, 60, 80); CHECK(T(13).step[0].note==-1);
+  // a chord after the end is neither written nor counted as left out
+  chord(0, 32*12, wide, 5, 80); note(0, 5, 32*12+3, 60, 80); release(0, 32*12+20);
+  CHECK(T(8).step[31].note==-1);
   auto r = finish();
   printf("notes %u dropped %u\n", r.notes, r.dropped);
   CHECK(r.dropped==2);

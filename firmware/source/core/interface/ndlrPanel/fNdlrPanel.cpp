@@ -1489,17 +1489,8 @@ static void captureTick()
     }
 }
 
-// Runs after the parts, so that a frame that arrives a little after the end of the pattern still
-// writes the notes that were due before the end. Notes due after it are not written.
-static void captureEndTick()
+static void playParts()
 {
-    if (s.capState == capRunning && due(s.pulse, s.capStart + s.capLength))
-        finishCapture(true);
-}
-
-static void musicTick()
-{
-    captureTick();
     updateLaunch();
     seqTick();
     playPadNotes();
@@ -1510,7 +1501,24 @@ static void musicTick()
     }
     tickMotif(0);
     tickMotif(1);
-    captureEndTick();
+}
+
+static void musicTick()
+{
+    captureTick();
+    // A frame can arrive a little after the end of the capture. The parts first play up to the
+    // last pulse inside it, so the notes due before the end are written, then the capture ends,
+    // and only then do the parts play on (or stay paused, with the Tracker playing the pattern),
+    // so no note from the next pass is written or played twice.
+    if (s.capState == capRunning && due(s.pulse, s.capStart + s.capLength))
+    {
+        const uint32_t now = s.pulse;
+        s.pulse = s.capStart + s.capLength - 1;
+        playParts();
+        s.pulse = now;
+        finishCapture(true);
+    }
+    playParts();
 }
 
 //==============================================================================================

@@ -88,6 +88,8 @@ void write(int part, int slot, int32_t pulse, int16_t note, uint8_t velocity, ui
     const PartLayout& layout = st.layout[part];
     if (layout.firstTrack < 0 || note < 0 || note > Sequencer::STEP_NOTE_MAX)
         return;
+    if (pulse < 0 || pulse >= int32_t(st.steps) * kPulsesPerStep)
+        return; // outside the pass: neither written nor left out
     if (slot >= layout.tracks)
     {
         ++st.result.dropped;
@@ -95,8 +97,6 @@ void write(int part, int slot, int32_t pulse, int16_t note, uint8_t velocity, ui
     }
     const int track = layout.firstTrack + slot;
     Step* step = stepAt(track, pulse);
-    if (step == nullptr)
-        return;
 
     // The step's micromove is a percentage of the step, so a pulse is 100 / 12 of it.
     const int offset = pulse % kPulsesPerStep;
@@ -172,7 +172,7 @@ bool active()
 
 void chord(int part, int32_t pulse, const int16_t* notes, int count, uint8_t velocity)
 {
-    if (!st.active || count <= 0)
+    if (!st.active || count <= 0 || pulse < 0 || pulse >= int32_t(st.steps) * kPulsesPerStep)
         return;
 
     // Track by track, the lowest note left and the biggest Chord FX shape built on it from the
